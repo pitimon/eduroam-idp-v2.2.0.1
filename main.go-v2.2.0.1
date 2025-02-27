@@ -1,33 +1,24 @@
 /*
 Program: eduroam-idp (Identity Provider Accept Analysis)
-Version: 2.2.0.2
+Version: 2.2.0.1
 Description: This program aggregates Access-Accept events for users from a specified domain
              using the Quickwit search engine's aggregation capabilities. It collects data 
              over a specified time range, processes the results, and outputs the aggregated 
-             data to a JSON or CSV file.
+             data to a JSON file.
 
-Usage: ./eduroam-idp [flags] <domain> [days|Ny|yxxxx|DD-MM-YYYY]
+Usage: ./eduroam-idp <domain> [days|Ny|DD-MM-YYYY]
       <domain>: The domain to search for (e.g., 'example.ac.th' or 'etlr1' or 'etlr2')
       [days]: Optional. The number of days (1-3650) to look back from the current date.
       [Ny]: Optional. The number of years (1y-10y) to look back from the current date.
-      [yxxxx]: Optional. A specific year (e.g., 'y2024') to analyze.
       [DD-MM-YYYY]: Optional. A specific date to process data for.
 
 Features:
 - Efficient data aggregation using Quickwit's aggregation queries
 - Optimized concurrent processing with worker pools
-- Flexible time range specification: days, years, specific year, or specific date
+- Flexible time range specification: number of days or specific date
 - Real-time progress reporting with accurate hit counts
-- Multiple output formats (JSON, CSV)
 - Streamlined output format focusing on essential information
 - Enhanced performance through code optimization
-
-Changes in version 2.2.0.2:
-- Added support for yxxxx parameter to specify a specific year (e.g., y2024)
-- Added CSV export option with -format flag
-- Implemented command-line flags for better configuration
-- Enhanced output path handling for different time range specifications
-- Improved year handling with leap year detection
 
 Changes in version 2.2.0.1:
 - Added context.Context for better cancellation and timeout management
@@ -40,7 +31,7 @@ Changes in version 2.2.0.1:
 - Added graceful shutdown with signal handling
 
 Author: [P.Itarun]
-Date: [February 26, 2025]
+Date: [February 25, 2025]
 License: [License Information if applicable]
 */
 
@@ -49,17 +40,14 @@ package main
 import (
     "bufio"
     "context"
-    "encoding/csv"
     "encoding/json"
     "errors"
-    "flag"
     "fmt"
     "io"
     "log"
     "net/http"
     "os"
     "os/signal"
-    "path/filepath"
     "sort"
     "strconv"
     "strings"
@@ -96,12 +84,6 @@ const (
     
     // SpecificDateFormat defines the format for input specific dates
     SpecificDateFormat = "02-01-2006"
-    
-    // OutputDirBase is the base directory for output files
-    OutputDirBase = "output"
-    
-    // DefaultOutputFormat is the default output file format
-    DefaultOutputFormat = "json"
 )
 
 var (
@@ -113,9 +95,6 @@ var (
     
     // ErrNoAggregationsInResponse indicates missing aggregations in the response
     ErrNoAggregationsInResponse = errors.New("no aggregations in response")
-    
-    // ErrInvalidOutputFormat indicates an invalid output format was specified
-    ErrInvalidOutputFormat = errors.New("invalid output format")
 )
 
 // Properties represents the authentication properties for Quickwit API
@@ -135,25 +114,17 @@ type LogEntry struct {
 // UserStats contains statistics for a user
 type UserStats struct {
     Providers map[string]bool
-    FirstSeen time.Time
-    LastSeen  time.Time
 }
 
 // ProviderStats contains statistics for a service provider
 type ProviderStats struct {
-    Users     map[string]bool
-    FirstSeen time.Time
-    LastSeen  time.Time
+    Users map[string]bool
 }
 
 // Result holds the aggregated results
 type Result struct {
     Users     map[string]*UserStats
     Providers map[string]*ProviderStats
-    StartDate time.Time
-    EndDate   time.Time
-    TotalHits int64
-    mu        sync.RWMutex
 }
 
 // SimplifiedOutputData represents the output JSON structure
@@ -163,7 +134,6 @@ type SimplifiedOutputData struct {
         Days      int    `json:"days"`
         StartDate string `json:"start_date"`
         EndDate   string `json:"end_date"`
-        TotalHits int64  `json:"total_hits"`
     } `json:"query_info"`
     Description   string `json:"description"`
     Summary       struct {
@@ -174,48 +144,23 @@ type SimplifiedOutputData struct {
         Provider  string   `json:"provider"`
         UserCount int      `json:"user_count"`
         Users     []string `json:"users"`
-        FirstSeen string   `json:"first_seen,omitempty"`
-        LastSeen  string   `json:"last_seen,omitempty"`
     } `json:"provider_stats"`
     UserStats []struct {
         Username  string   `json:"username"`
         Providers []string `json:"providers"`
-        FirstSeen string   `json:"first_seen,omitempty"`
-        LastSeen  string   `json:"last_seen,omitempty"`
     } `json:"user_stats"`
-}
-
-// TimeRange represents the time range specification
-type TimeRange struct {
-    StartDate    time.Time
-    EndDate      time.Time
-    Days         int
-    SpecificDate bool
-    SpecificYear bool
-    Year         int
 }
 
 // Job represents a single day's query job
 type Job struct {
     StartTimestamp int64
     EndTimestamp   int64
-    Date           time.Time
 }
 
 // QueryStats tracks the statistics of queries
 type QueryStats struct {
     ProcessedDays atomic.Int32
     TotalHits     atomic.Int64
-}
-
-// Config holds the configuration for the program
-type Config struct {
-    Domain       string
-    OutputFormat string
-    LogLevel     string
-    LogFile      string
-    NumWorkers   int
-    TimeRange    TimeRange
 }
 
 // HTTPClient is a wrapper around the standard http.Client with authentication
@@ -387,11 +332,11 @@ func Worker(ctx context.Context, job Job, resultChan chan<- LogEntry, query map[
         return 0, err
     }
 
-    return ProcessAggregations(ctx, result, resultChan, job.Date)
+    return ProcessAggregations(ctx, result, resultChan)
 }
 
 // ProcessAggregations processes the aggregation results
-func ProcessAggregations(ctx context.Context, result map[string]interface{}, resultChan chan<- LogEntry, jobDate time.Time) (int64, error) {
+func ProcessAggregations(ctx context.Context, result map[string]interface{}, resultChan chan<- LogEntry) (int64, error) {
     // Check for context cancellation
     select {
     case <-ctx.Done():
@@ -432,14 +377,14 @@ func ProcessAggregations(ctx context.Context, result map[string]interface{}, res
         docCount := int64(bucket["doc_count"].(float64))
         totalHits += docCount
 
-        ProcessUserBucket(ctx, bucket, username, resultChan, jobDate)
+        ProcessUserBucket(ctx, bucket, username, resultChan)
     }
 
     return totalHits, nil
 }
 
 // ProcessUserBucket processes a single user bucket from aggregations
-func ProcessUserBucket(ctx context.Context, bucket map[string]interface{}, username string, resultChan chan<- LogEntry, jobDate time.Time) {
+func ProcessUserBucket(ctx context.Context, bucket map[string]interface{}, username string, resultChan chan<- LogEntry) {
     // Check for context cancellation
     select {
     case <-ctx.Done():
@@ -455,14 +400,14 @@ func ProcessUserBucket(ctx context.Context, bucket map[string]interface{}, usern
                     continue
                 }
                 provider := providerBucket["key"].(string)
-                ProcessUserProviderDaily(ctx, bucket, username, provider, resultChan, jobDate)
+                ProcessUserProviderDaily(ctx, bucket, username, provider, resultChan)
             }
         }
     }
 }
 
 // ProcessUserProviderDaily processes daily activities for a user and provider
-func ProcessUserProviderDaily(ctx context.Context, bucket map[string]interface{}, username, provider string, resultChan chan<- LogEntry, jobDate time.Time) {
+func ProcessUserProviderDaily(ctx context.Context, bucket map[string]interface{}, username, provider string, resultChan chan<- LogEntry) {
     // Check for context cancellation
     select {
     case <-ctx.Done():
@@ -479,16 +424,6 @@ func ProcessUserProviderDaily(ctx context.Context, bucket map[string]interface{}
                 }
 
                 timestamp := time.Unix(int64(dailyBucket["key"].(float64)/1000), 0)
-                
-                // If jobDate is provided, use it to ensure consistent date
-                if !jobDate.IsZero() {
-                    timestamp = time.Date(
-                        jobDate.Year(), jobDate.Month(), jobDate.Day(),
-                        timestamp.Hour(), timestamp.Minute(), timestamp.Second(),
-                        0, timestamp.Location(),
-                    )
-                }
-                
                 select {
                 case resultChan <- LogEntry{
                     Username:        username,
@@ -504,79 +439,40 @@ func ProcessUserProviderDaily(ctx context.Context, bucket map[string]interface{}
 }
 
 // ProcessResults processes the search results and updates the result struct
-func ProcessResults(ctx context.Context, resultChan <-chan LogEntry, result *Result) {
+func ProcessResults(ctx context.Context, resultChan <-chan LogEntry, result *Result, mu *sync.Mutex) {
     userMap := make(map[string]map[string]bool)
-    userFirstSeen := make(map[string]time.Time)
-    userLastSeen := make(map[string]time.Time)
-    providerFirstSeen := make(map[string]time.Time)
-    providerLastSeen := make(map[string]time.Time)
     
     for {
         select {
         case entry, ok := <-resultChan:
             if !ok {
                 // Channel closed, finalize results
-                FinalizeResults(userMap, userFirstSeen, userLastSeen, providerFirstSeen, providerLastSeen, result)
+                FinalizeResults(userMap, result, mu)
                 return
             }
             
             if _, exists := userMap[entry.Username]; !exists {
                 userMap[entry.Username] = make(map[string]bool)
-                userFirstSeen[entry.Username] = entry.Timestamp
-                userLastSeen[entry.Username] = entry.Timestamp
             }
             userMap[entry.Username][entry.ServiceProvider] = true
             
-            // Update user's first/last seen
-            if entry.Timestamp.Before(userFirstSeen[entry.Username]) {
-                userFirstSeen[entry.Username] = entry.Timestamp
-            }
-            if entry.Timestamp.After(userLastSeen[entry.Username]) {
-                userLastSeen[entry.Username] = entry.Timestamp
-            }
-            
-            // Update provider's first/last seen
-            if firstSeen, exists := providerFirstSeen[entry.ServiceProvider]; !exists || entry.Timestamp.Before(firstSeen) {
-                providerFirstSeen[entry.ServiceProvider] = entry.Timestamp
-            }
-            if lastSeen, exists := providerLastSeen[entry.ServiceProvider]; !exists || entry.Timestamp.After(lastSeen) {
-                providerLastSeen[entry.ServiceProvider] = entry.Timestamp
-            }
-            
         case <-ctx.Done():
             // Context cancelled, finalize what we have
-            FinalizeResults(userMap, userFirstSeen, userLastSeen, providerFirstSeen, providerLastSeen, result)
+            FinalizeResults(userMap, result, mu)
             return
         }
     }
 }
 
 // FinalizeResults updates the final result structure from the working maps
-func FinalizeResults(
-    userMap map[string]map[string]bool,
-    userFirstSeen map[string]time.Time,
-    userLastSeen map[string]time.Time,
-    providerFirstSeen map[string]time.Time,
-    providerLastSeen map[string]time.Time,
-    result *Result) {
-    
-    result.mu.Lock()
-    defer result.mu.Unlock()
+func FinalizeResults(userMap map[string]map[string]bool, result *Result, mu *sync.Mutex) {
+    mu.Lock()
+    defer mu.Unlock()
 
     for username, providers := range userMap {
         if _, exists := result.Users[username]; !exists {
             result.Users[username] = &UserStats{
                 Providers: make(map[string]bool),
-                FirstSeen: userFirstSeen[username],
-                LastSeen:  userLastSeen[username],
-            }
-        } else {
-            // Update existing user's first/last seen
-            if userFirstSeen[username].Before(result.Users[username].FirstSeen) {
-                result.Users[username].FirstSeen = userFirstSeen[username]
-            }
-            if userLastSeen[username].After(result.Users[username].LastSeen) {
-                result.Users[username].LastSeen = userLastSeen[username]
             }
         }
 
@@ -585,17 +481,7 @@ func FinalizeResults(
             
             if _, exists := result.Providers[provider]; !exists {
                 result.Providers[provider] = &ProviderStats{
-                    Users:     make(map[string]bool),
-                    FirstSeen: providerFirstSeen[provider],
-                    LastSeen:  providerLastSeen[provider],
-                }
-            } else {
-                // Update existing provider's first/last seen
-                if providerFirstSeen[provider].Before(result.Providers[provider].FirstSeen) {
-                    result.Providers[provider].FirstSeen = providerFirstSeen[provider]
-                }
-                if providerLastSeen[provider].After(result.Providers[provider].LastSeen) {
-                    result.Providers[provider].LastSeen = providerLastSeen[provider]
+                    Users: make(map[string]bool),
                 }
             }
             result.Providers[provider].Users[username] = true
@@ -604,17 +490,13 @@ func FinalizeResults(
 }
 
 // CreateOutputData creates the output JSON structure
-func CreateOutputData(result *Result, domain string, timeRange TimeRange) SimplifiedOutputData {
+func CreateOutputData(result *Result, domain string, startDate, endDate time.Time, days int) SimplifiedOutputData {
     output := SimplifiedOutputData{}
     output.QueryInfo.Domain = domain
-    output.QueryInfo.Days = timeRange.Days
-    output.QueryInfo.StartDate = timeRange.StartDate.Format(DateTimeFormat)
-    output.QueryInfo.EndDate = timeRange.EndDate.Format(DateTimeFormat)
-    output.QueryInfo.TotalHits = result.TotalHits
+    output.QueryInfo.Days = days
+    output.QueryInfo.StartDate = startDate.Format(DateTimeFormat)
+    output.QueryInfo.EndDate = endDate.Format(DateTimeFormat)
     output.Description = "Aggregated Access-Accept events for the specified domain and time range."
-
-    result.mu.RLock()
-    defer result.mu.RUnlock()
 
     output.Summary.TotalUsers = len(result.Users)
     output.Summary.TotalProviders = len(result.Providers)
@@ -624,8 +506,6 @@ func CreateOutputData(result *Result, domain string, timeRange TimeRange) Simpli
         Provider  string   `json:"provider"`
         UserCount int      `json:"user_count"`
         Users     []string `json:"users"`
-        FirstSeen string   `json:"first_seen,omitempty"`
-        LastSeen  string   `json:"last_seen,omitempty"`
     }, 0, len(result.Providers))
 
     for provider, stats := range result.Providers {
@@ -639,14 +519,10 @@ func CreateOutputData(result *Result, domain string, timeRange TimeRange) Simpli
             Provider  string   `json:"provider"`
             UserCount int      `json:"user_count"`
             Users     []string `json:"users"`
-            FirstSeen string   `json:"first_seen,omitempty"`
-            LastSeen  string   `json:"last_seen,omitempty"`
         }{
             Provider:  provider,
             UserCount: len(users),
             Users:     users,
-            FirstSeen: stats.FirstSeen.Format(DateFormat),
-            LastSeen:  stats.LastSeen.Format(DateFormat),
         })
     }
 
@@ -659,8 +535,6 @@ func CreateOutputData(result *Result, domain string, timeRange TimeRange) Simpli
     output.UserStats = make([]struct {
         Username  string   `json:"username"`
         Providers []string `json:"providers"`
-        FirstSeen string   `json:"first_seen,omitempty"`
-        LastSeen  string   `json:"last_seen,omitempty"`
     }, 0, len(result.Users))
 
     for username, stats := range result.Users {
@@ -673,13 +547,9 @@ func CreateOutputData(result *Result, domain string, timeRange TimeRange) Simpli
         output.UserStats = append(output.UserStats, struct {
             Username  string   `json:"username"`
             Providers []string `json:"providers"`
-            FirstSeen string   `json:"first_seen,omitempty"`
-            LastSeen  string   `json:"last_seen,omitempty"`
         }{
             Username:  username,
             Providers: providers,
-            FirstSeen: stats.FirstSeen.Format(DateFormat),
-            LastSeen:  stats.LastSeen.Format(DateFormat),
         })
     }
 
@@ -691,75 +561,44 @@ func CreateOutputData(result *Result, domain string, timeRange TimeRange) Simpli
     return output
 }
 
-// ParseTimeRange parses the command line parameter into a TimeRange struct
-func ParseTimeRange(param string) (TimeRange, error) {
-    var timeRange TimeRange
-    
-    // Check for year format (yxxxx)
-    if strings.HasPrefix(param, "y") && len(param) == 5 {
-        yearStr := param[1:]
-        if year, err := strconv.Atoi(yearStr); err == nil {
-            if year >= 2000 && year <= 2100 {
-                timeRange.SpecificYear = true
-                timeRange.Year = year
-                timeRange.StartDate = time.Date(year, 1, 1, 0, 0, 0, 0, time.Local)
-                timeRange.EndDate = time.Date(year, 12, 31, 23, 59, 59, 999999999, time.Local)
-                
-                // Calculate days (accounting for leap years)
-                timeRange.Days = 365
-                if isLeapYear(year) {
-                    timeRange.Days = 366
-                }
-                
-                return timeRange, nil
-            }
-            return timeRange, fmt.Errorf("invalid year range. Must be between 2000 and 2100")
-        }
-        return timeRange, fmt.Errorf("invalid year format. Use y followed by 4 digits (e.g., y2024)")
-    }
-    
+// ParseDate parses the command line parameter into start and end dates
+func ParseDate(param string) (startDate, endDate time.Time, days int, specificDate bool, err error) {
     // Check for year format (Ny)
     if strings.HasSuffix(param, "y") {
         yearStr := strings.TrimSuffix(param, "y")
         if years, err := strconv.Atoi(yearStr); err == nil {
             if years >= 1 && years <= MaxYearsRange {
-                timeRange.Days = years * 365
-                timeRange.EndDate = time.Now()
-                timeRange.StartDate = timeRange.EndDate.AddDate(-years, 0, 0)
-                return timeRange, nil
+                days = years * 365
+                endDate = time.Now()
+                startDate = endDate.AddDate(0, 0, -days+1)
+                return startDate, endDate, days, false, nil
             }
-            return timeRange, fmt.Errorf("invalid year range. Must be between 1y and %dy", MaxYearsRange)
+            return time.Time{}, time.Time{}, 0, false, fmt.Errorf("invalid year range. Must be between 1y and %dy", MaxYearsRange)
         }
-        return timeRange, fmt.Errorf("invalid year format. Use 1y-%dy", MaxYearsRange)
+        return time.Time{}, time.Time{}, 0, false, fmt.Errorf("invalid year format. Use 1y-%dy", MaxYearsRange)
     }
     
     // Check for day count
     if d, err := strconv.Atoi(param); err == nil {
         if d >= 1 && d <= MaxDaysRange {
-            timeRange.Days = d
-            timeRange.EndDate = time.Now()
-            timeRange.StartDate = timeRange.EndDate.AddDate(0, 0, -d+1)
-            return timeRange, nil
+            days = d
+            endDate = time.Now()
+            startDate = endDate.AddDate(0, 0, -days+1)
+            return startDate, endDate, days, false, nil
         }
-        return timeRange, fmt.Errorf("invalid number of days. Must be between 1 and %d", MaxDaysRange)
+        return time.Time{}, time.Time{}, 0, false, fmt.Errorf("invalid number of days. Must be between 1 and %d", MaxDaysRange)
     }
     
     // Check for specific date format
-    timeRange.SpecificDate = true
-    var err error
-    timeRange.StartDate, err = time.Parse(SpecificDateFormat, param)
+    specificDate = true
+    startDate, err = time.Parse(SpecificDateFormat, param)
     if err != nil {
-        return timeRange, fmt.Errorf("invalid date format. Use DD-MM-YYYY: %w", err)
+        return time.Time{}, time.Time{}, 0, false, fmt.Errorf("invalid date format. Use DD-MM-YYYY: %w", err)
     }
-    timeRange.EndDate = timeRange.StartDate.AddDate(0, 0, 1)
-    timeRange.Days = 1
+    endDate = startDate.AddDate(0, 0, 1)
+    days = 1
     
-    return timeRange, nil
-}
-
-// isLeapYear checks if a year is a leap year
-func isLeapYear(year int) bool {
-    return year%4 == 0 && (year%100 != 0 || year%400 == 0)
+    return startDate, endDate, days, specificDate, nil
 }
 
 // GetNumWorkers returns the number of workers to use, from environment or default
@@ -772,22 +611,19 @@ func GetNumWorkers() int {
     return DefaultNumWorkers
 }
 
-// SaveOutputToJSON saves the output data to a JSON file
-func SaveOutputToJSON(outputData SimplifiedOutputData, domain string, timeRange TimeRange) (string, error) {
-    outputDir := filepath.Join(OutputDirBase, domain)
+// SaveOutputToFile saves the output data to a JSON file
+func SaveOutputToFile(outputData SimplifiedOutputData, domain string, startDate time.Time, days int, specificDate bool) (string, error) {
+    outputDir := fmt.Sprintf("output/%s", domain)
     if err := os.MkdirAll(outputDir, 0755); err != nil {
         return "", fmt.Errorf("error creating output directory: %w", err)
     }
 
     currentTime := time.Now().Format("20060102-150405")
     var filename string
-    
-    if timeRange.SpecificDate {
-        filename = fmt.Sprintf("%s/%s-%s.json", outputDir, currentTime, timeRange.StartDate.Format("20060102"))
-    } else if timeRange.SpecificYear {
-        filename = fmt.Sprintf("%s/%s-y%d.json", outputDir, currentTime, timeRange.Year)
+    if specificDate {
+        filename = fmt.Sprintf("%s/%s-%s.json", outputDir, currentTime, startDate.Format("20060102"))
     } else {
-        filename = fmt.Sprintf("%s/%s-%dd.json", outputDir, currentTime, timeRange.Days)
+        filename = fmt.Sprintf("%s/%s-%dd.json", outputDir, currentTime, days)
     }
 
     jsonData, err := json.MarshalIndent(outputData, "", "  ")
@@ -802,149 +638,7 @@ func SaveOutputToJSON(outputData SimplifiedOutputData, domain string, timeRange 
     return filename, nil
 }
 
-// ExportToCSV exports the results to CSV files
-func ExportToCSV(result *Result, domain string, timeRange TimeRange) ([]string, error) {
-    outputDir := filepath.Join(OutputDirBase, domain)
-    if err := os.MkdirAll(outputDir, 0755); err != nil {
-        return nil, fmt.Errorf("error creating output directory: %w", err)
-    }
-
-    currentTime := time.Now().Format("20060102-150405")
-    var baseFilename string
-    
-    if timeRange.SpecificDate {
-        baseFilename = fmt.Sprintf("%s-%s", currentTime, timeRange.StartDate.Format("20060102"))
-    } else if timeRange.SpecificYear {
-        baseFilename = fmt.Sprintf("%s-y%d", currentTime, timeRange.Year)
-    } else {
-        baseFilename = fmt.Sprintf("%s-%dd", currentTime, timeRange.Days)
-    }
-    
-    // Create users CSV file
-    usersFilename := filepath.Join(outputDir, baseFilename+"-users.csv")
-    usersFile, err := os.Create(usersFilename)
-    if err != nil {
-        return nil, fmt.Errorf("error creating users CSV file: %w", err)
-    }
-    defer usersFile.Close()
-
-    usersWriter := csv.NewWriter(usersFile)
-    defer usersWriter.Flush()
-
-    // Write users CSV header
-    if err := usersWriter.Write([]string{"Username", "Providers Count", "Providers", "First Seen", "Last Seen"}); err != nil {
-        return nil, fmt.Errorf("error writing users CSV header: %w", err)
-    }
-
-    // Write users data
-    result.mu.RLock()
-    for username, stats := range result.Users {
-        providers := make([]string, 0, len(stats.Providers))
-        for provider := range stats.Providers {
-            providers = append(providers, provider)
-        }
-        sort.Strings(providers)
-        
-        record := []string{
-            username,
-            strconv.Itoa(len(providers)),
-            strings.Join(providers, "; "),
-            stats.FirstSeen.Format(DateFormat),
-            stats.LastSeen.Format(DateFormat),
-        }
-        if err := usersWriter.Write(record); err != nil {
-            result.mu.RUnlock()
-            return nil, fmt.Errorf("error writing user record: %w", err)
-        }
-    }
-    
-    // Create providers CSV file
-    providersFilename := filepath.Join(outputDir, baseFilename+"-providers.csv")
-    providersFile, err := os.Create(providersFilename)
-    if err != nil {
-        result.mu.RUnlock()
-        return nil, fmt.Errorf("error creating providers CSV file: %w", err)
-    }
-    defer providersFile.Close()
-
-    providersWriter := csv.NewWriter(providersFile)
-    defer providersWriter.Flush()
-
-    // Write providers CSV header
-    if err := providersWriter.Write([]string{"Provider", "Users Count", "First Seen", "Last Seen"}); err != nil {
-        result.mu.RUnlock()
-        return nil, fmt.Errorf("error writing providers CSV header: %w", err)
-    }
-
-    // Write providers data
-    for provider, stats := range result.Providers {
-        record := []string{
-            provider,
-            strconv.Itoa(len(stats.Users)),
-            stats.FirstSeen.Format(DateFormat),
-            stats.LastSeen.Format(DateFormat),
-        }
-        if err := providersWriter.Write(record); err != nil {
-            result.mu.RUnlock()
-            return nil, fmt.Errorf("error writing provider record: %w", err)
-        }
-    }
-    result.mu.RUnlock()
-    
-    // Create summary CSV file
-    summaryFilename := filepath.Join(outputDir, baseFilename+"-summary.csv")
-    summaryFile, err := os.Create(summaryFilename)
-    if err != nil {
-        return nil, fmt.Errorf("error creating summary CSV file: %w", err)
-    }
-    defer summaryFile.Close()
-
-    summaryWriter := csv.NewWriter(summaryFile)
-    defer summaryWriter.Flush()
-
-    // Write summary CSV header and data
-    if err := summaryWriter.Write([]string{"Parameter", "Value"}); err != nil {
-        return nil, fmt.Errorf("error writing summary CSV header: %w", err)
-    }
-    
-    summaryData := [][]string{
-        {"Domain", domain},
-        {"Start Date", timeRange.StartDate.Format(DateTimeFormat)},
-        {"End Date", timeRange.EndDate.Format(DateTimeFormat)},
-        {"Total Days", strconv.Itoa(timeRange.Days)},
-        {"Total Users", strconv.Itoa(len(result.Users))},
-        {"Total Providers", strconv.Itoa(len(result.Providers))},
-        {"Total Hits", strconv.FormatInt(result.TotalHits, 10)},
-        {"Exported At", time.Now().Format(DateTimeFormat)},
-    }
-    
-    for _, record := range summaryData {
-        if err := summaryWriter.Write(record); err != nil {
-            return nil, fmt.Errorf("error writing summary record: %w", err)
-        }
-    }
-    
-    return []string{usersFilename, providersFilename, summaryFilename}, nil
-}
-
 func main() {
-    // Define command line flags
-    outputFormat := flag.String("format", DefaultOutputFormat, "Output format (json or csv)")
-    configFile := flag.String("config", PropertiesFile, "Path to configuration file")
-    // Defined but not implemented yet in this version - ignoring in code to avoid compile errors
-    _ = flag.String("log-level", "info", "Log level (error, warn, info, debug)")
-    _ = flag.String("log-file", "", "Path to log file")
-    numWorkers := flag.Int("workers", 0, "Number of worker goroutines (overrides environment variable)")
-    
-    // Parse flags
-    flag.Parse()
-    
-    // Validate output format
-    if *outputFormat != "json" && *outputFormat != "csv" {
-        fmt.Fprintf(os.Stderr, "Error: Invalid output format. Must be 'json' or 'csv'.\n")
-        os.Exit(1)
-    }
-    
     // Setup signal handling for graceful shutdown
     ctx, cancel := context.WithCancel(context.Background())
     defer cancel()
@@ -957,65 +651,59 @@ func main() {
         cancel()
     }()
 
-    // Check remaining arguments
-    args := flag.Args()
-    if len(args) < 1 || len(args) > 2 {
-        fmt.Println("Usage: ./eduroam-idp [flags] <domain> [days|Ny|yxxxx|DD-MM-YYYY]")
-        fmt.Println("  <domain>: domain to search for (e.g., 'example.ac.th', 'etlr1')")
-        fmt.Println("  [days]: number of days (1-3650)")
-        fmt.Println("  [Ny]: number of years (1y-10y)")
-        fmt.Println("  [yxxxx]: specific year (e.g., y2024)")
-        fmt.Println("  [DD-MM-YYYY]: specific date")
-        fmt.Println()
-        fmt.Println("Flags:")
-        flag.PrintDefaults()
+    if len(os.Args) < 2 || len(os.Args) > 3 {
+        fmt.Println("Usage: ./eduroam-idp <domain> [days|Ny|DD-MM-YYYY]")
+        fmt.Println("  domain: domain to search for (e.g., 'example.ac.th', 'etlr1')")
+        fmt.Println("  days: number of days (1-3650)")
+        fmt.Println("  Ny: number of years (1y-10y)")
+        fmt.Println("  DD-MM-YYYY: specific date")
         os.Exit(1)
     }
 
-    domain := args[0]
-    var timeRange TimeRange
+    domain := os.Args[1]
+    var startDate, endDate time.Time
+    var days int
+    var specificDate bool
 
-    if len(args) == 2 {
+    if len(os.Args) == 3 {
         var err error
-        timeRange, err = ParseTimeRange(args[1])
+        startDate, endDate, days, specificDate, err = ParseDate(os.Args[2])
         if err != nil {
-            log.Fatalf("Error parsing time range parameter: %v", err)
+            log.Fatalf("Error parsing date parameter: %v", err)
         }
     } else {
         // Default: 1 day
-        timeRange.Days = 1
-        timeRange.EndDate = time.Now()
-        timeRange.StartDate = timeRange.EndDate.AddDate(0, 0, -1)
+        days = 1
+        endDate = time.Now()
+        startDate = endDate.AddDate(0, 0, -1)
+        specificDate = false
     }
 
     // Normalize date times to beginning/end of day
-    timeRange.StartDate = time.Date(timeRange.StartDate.Year(), timeRange.StartDate.Month(), timeRange.StartDate.Day(), 0, 0, 0, 0, timeRange.StartDate.Location())
-    timeRange.EndDate = time.Date(timeRange.EndDate.Year(), timeRange.EndDate.Month(), timeRange.EndDate.Day(), 23, 59, 59, 999999999, timeRange.EndDate.Location())
+    startDate = time.Date(startDate.Year(), startDate.Month(), startDate.Day(), 0, 0, 0, 0, startDate.Location())
+    endDate = time.Date(endDate.Year(), endDate.Month(), endDate.Day(), 23, 59, 59, 999999999, endDate.Location())
 
-    props, err := ReadProperties(*configFile)
+    props, err := ReadProperties(PropertiesFile)
     if err != nil {
         log.Fatalf("Error reading properties: %v", err)
     }
 
     httpClient := NewHTTPClient(props)
 
-    // Display query parameters
-    if timeRange.SpecificDate {
-        fmt.Printf("Searching for date: %s\n", timeRange.StartDate.Format(DateFormat))
-    } else if timeRange.SpecificYear {
-        fmt.Printf("Searching for year: %d\n", timeRange.Year)
+    if specificDate {
+        fmt.Printf("Searching for date: %s\n", startDate.Format(DateFormat))
     } else {
         fmt.Printf("Searching from %s to %s (%d days)\n", 
-            timeRange.StartDate.Format(DateFormat), 
-            timeRange.EndDate.Format(DateFormat),
-            timeRange.Days)
+            startDate.Format(DateFormat), 
+            endDate.Format(DateFormat),
+            days)
     }
 
     domainName := GetDomain(domain)
     query := map[string]interface{}{
         "query":           fmt.Sprintf(`message_type:"Access-Accept" AND realm:"%s" NOT service_provider:"client"`, domainName),
-        "start_timestamp": timeRange.StartDate.Unix(),
-        "end_timestamp":   timeRange.EndDate.Unix(),
+        "start_timestamp": startDate.Unix(),
+        "end_timestamp":   endDate.Unix(),
         "max_hits":        10000,
     }
 
@@ -1026,29 +714,23 @@ func main() {
     stats.ProcessedDays.Store(0)
     stats.TotalHits.Store(0)
     
+    var mu sync.Mutex
     var wg sync.WaitGroup
 
-    // Determine workers count
-    workersCount := GetNumWorkers()
-    if *numWorkers > 0 {
-        workersCount = *numWorkers
-    }
-
-    jobs := make(chan Job, timeRange.Days)
+    jobs := make(chan Job, days)
+    numWorkers := GetNumWorkers()
 
     queryStart := time.Now()
-    fmt.Printf("Using %d workers\n", workersCount)
+    fmt.Printf("Using %d workers\n", numWorkers)
 
     // Create result storage
     result := &Result{
         Users:     make(map[string]*UserStats),
         Providers: make(map[string]*ProviderStats),
-        StartDate: timeRange.StartDate,
-        EndDate:   timeRange.EndDate,
     }
 
     // Start workers
-    for w := 1; w <= workersCount; w++ {
+    for w := 1; w <= numWorkers; w++ {
         wg.Add(1)
         go func(workerId int) {
             defer wg.Done()
@@ -1072,7 +754,7 @@ func main() {
                 current := stats.ProcessedDays.Add(1)
                 
                 fmt.Printf("\rProgress: %d/%d days processed, Progress hits: %d", 
-                    current, timeRange.Days, stats.TotalHits.Load())
+                    current, days, stats.TotalHits.Load())
             }
         }(w)
     }
@@ -1080,22 +762,21 @@ func main() {
     // Start result processor
     processDone := make(chan struct{})
     go func() {
-        ProcessResults(ctx, resultChan, result)
+        ProcessResults(ctx, resultChan, result, &mu)
         close(processDone)
     }()
 
     // Queue jobs
-    currentDate := timeRange.StartDate
-    for currentDate.Before(timeRange.EndDate) {
+    currentDate := startDate
+    for currentDate.Before(endDate) {
         nextDate := currentDate.Add(24 * time.Hour)
-        if nextDate.After(timeRange.EndDate) {
-            nextDate = timeRange.EndDate
+        if nextDate.After(endDate) {
+            nextDate = endDate
         }
         select {
         case jobs <- Job{
             StartTimestamp: currentDate.Unix(),
             EndTimestamp:   nextDate.Unix(),
-            Date:           currentDate,
         }:
         case <-ctx.Done():
             break
@@ -1125,44 +806,26 @@ func main() {
     default:
     }
 
-    // Store final total hits
-    result.TotalHits = stats.TotalHits.Load()
-
     queryDuration := time.Since(queryStart)
 
     fmt.Printf("\n")
     fmt.Printf("Number of users: %d\n", len(result.Users))
     fmt.Printf("Number of providers: %d\n", len(result.Providers))
-    fmt.Printf("Total hits: %d\n", result.TotalHits)
 
-    // Export according to format
-    exportStart := time.Now()
-    if *outputFormat == "csv" {
-        filenames, err := ExportToCSV(result, domain, timeRange)
-        if err != nil {
-            log.Fatalf("Error exporting to CSV: %v", err)
-        }
-        fmt.Printf("Results have been saved to:\n")
-        for _, filename := range filenames {
-            fmt.Printf("  - %s\n", filename)
-        }
-    } else {
-        // Create output
-        outputData := CreateOutputData(result, domain, timeRange)
-        
-        // Save output
-        filename, err := SaveOutputToJSON(outputData, domain, timeRange)
-        if err != nil {
-            log.Fatalf("Error saving output: %v", err)
-        }
-        
-        fmt.Printf("Results have been saved to %s\n", filename)
+    // Create output
+    processStart := time.Now()
+    outputData := CreateOutputData(result, domain, startDate, endDate, days)
+    processDuration := time.Since(processStart)
+
+    // Save output
+    filename, err := SaveOutputToFile(outputData, domain, startDate, days, specificDate)
+    if err != nil {
+        log.Fatalf("Error saving output: %v", err)
     }
-    
-    exportDuration := time.Since(exportStart)
 
+    fmt.Printf("Results have been saved to %s\n", filename)
     fmt.Printf("Time taken:\n")
     fmt.Printf("  Quickwit query: %v\n", queryDuration)
-    fmt.Printf("  Export processing: %v\n", exportDuration)
+    fmt.Printf("  Local processing: %v\n", processDuration)
     fmt.Printf("  Overall: %v\n", time.Since(queryStart))
 }
